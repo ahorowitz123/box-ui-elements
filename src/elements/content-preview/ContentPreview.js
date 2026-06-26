@@ -135,6 +135,9 @@ type Props = {
     },
     previewLibraryVersion: string,
     previewMode?: 'default' | 'shared_file' | 'shared_folder' | 'editable_shared_file' | 'inline_feed',
+    // npm path: consumer-bundled URL of pdfjs's worker file (typically via webpack `?url`).
+    // Forwarded to box-content-preview as show({ pdfjs: { workerSrc } }).
+    pdfjsWorkerSrc?: string,
     requestInterceptor?: Function,
     responseInterceptor?: Function,
     sharedLink?: string,
@@ -255,6 +258,10 @@ class ContentPreview extends React.PureComponent<Props, State> {
     state: State;
 
     preview: any;
+
+    // Cached module reference once box-content-preview is dynamically imported
+    // under the npm-load path (useNpmBoxContentPreview feature flag).
+    npmPreviewModule: ?{ Preview: any };
 
     api: API;
 
@@ -447,8 +454,12 @@ class ContentPreview extends React.PureComponent<Props, State> {
     componentDidMount(): void {
         // Always load Box.Preview library assets
         // Even when children are provided, we need assets ready for transitions
-        this.loadStylesheet();
-        this.loadScript();
+        if (this.shouldUseNpmPreview()) {
+            this.loadNpmPreview();
+        } else {
+            this.loadStylesheet();
+            this.loadScript();
+        }
 
         const { currentFileId } = this.state;
         const { loadingIndicatorDelayMs } = this.props;
@@ -464,6 +475,32 @@ class ContentPreview extends React.PureComponent<Props, State> {
         this.fetchFile(currentFileId);
         this.focusPreview();
     }
+
+    /**
+     * Whether to load Preview from the npm package (box-content-preview)
+     * instead of injecting the CDN script tag. Driven by the
+     * `useNpmBoxContentPreview` feature flag.
+     */
+    shouldUseNpmPreview(): boolean {
+        return isFeatureEnabled(this.props.features, 'useNpmBoxContentPreview');
+    }
+
+    /**
+     * Asynchronously loads the npm-published box-content-preview package
+     * (and its CSS) via webpack-resolved dynamic imports. Stashes the module
+     * so loadPreview() can read the Preview constructor synchronously.
+     */
+    loadNpmPreview = async (): Promise<void> => {
+        if (this.npmPreviewModule) {
+            return;
+        }
+        const [previewModule] = await Promise.all([
+            import(/* webpackChunkName: "box-content-preview" */ 'box-content-preview'),
+            import(/* webpackChunkName: "box-content-preview" */ 'box-content-preview/styles.css'),
+        ]);
+        this.npmPreviewModule = previewModule;
+        this.loadPreview();
+    };
 
     static getDerivedStateFromProps(props: Props, state: State) {
         const { fileId } = props;
@@ -599,6 +636,9 @@ class ContentPreview extends React.PureComponent<Props, State> {
      * @return {boolean} true if preview is loaded
      */
     isPreviewLibraryLoaded(): boolean {
+        if (this.npmPreviewModule) {
+            return true;
+        }
         return !!global.Box && !!global.Box.Preview;
     }
 
@@ -985,7 +1025,27 @@ class ContentPreview extends React.PureComponent<Props, State> {
             skipServerUpdate: true,
             useHotkeys: false,
         };
-        const { Preview } = global.Box;
+
+        // npm path: forward the pdfjs worker URL the consumer's bundler emitted.
+        if (this.npmPreviewModule && this.props.pdfjsWorkerSrc) {
+            previewOptions.pdfjs = { workerSrc: this.props.pdfjsWorkerSrc };
+        }
+
+        // npm path: forward location data to box-content-preview's `this.location`.
+        // Without this, viewer code that builds asset URLs from staticBaseURI (e.g., the
+        // video viewer's Shaka loader) gets `undefined` and fails silently. Metric code
+        // that reads `metrics.locale` also throws.
+        if (this.npmPreviewModule) {
+            const { staticHost, staticPath, language, previewLibraryVersion } = this.props;
+            const trailingSlash = staticHost.endsWith('/') ? '' : '/';
+            previewOptions.location = {
+                staticBaseURI: `${staticHost}${trailingSlash}${staticPath}/`,
+                version: previewLibraryVersion,
+                locale: language,
+            };
+        }
+
+        const Preview = this.npmPreviewModule ? this.npmPreviewModule.Preview : global.Box.Preview;
         this.preview = new Preview();
         this.preview.addListener('load', this.onPreviewLoad);
         this.preview.addListener('preload', this.endLoadingSession);
